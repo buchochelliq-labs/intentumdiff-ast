@@ -74,24 +74,39 @@ impl Role {
 pub fn roles_for_native(native: &str) -> Vec<Role> {
     let mut roles = Vec::new();
     match native {
-        "lambda" | "lambda_expression" | "arrow_function" | "closure_expression"
-        | "function_expression" | "anonymous_function" => {
+        "lambda"
+        | "lambda_expression"
+        | "arrow_function"
+        | "closure_expression"
+        | "function_expression"
+        | "anonymous_function" => {
             roles.push(Role::Anonymous);
         }
         "method_definition" | "method_declaration" | "constructor_declaration" => {
             roles.push(Role::Declaration);
             roles.push(Role::Member);
         }
-        "function_definition" | "function_declaration" | "function_item" | "class_definition"
-        | "class_declaration" | "struct_item" | "trait_item" | "interface_declaration" => {
+        "function_definition"
+        | "function_declaration"
+        | "function_item"
+        | "class_definition"
+        | "class_declaration"
+        | "struct_item"
+        | "trait_item"
+        | "interface_declaration" => {
             roles.push(Role::Declaration);
         }
         "generator_function" | "generator_function_declaration" => {
             roles.push(Role::Declaration);
             roles.push(Role::Suspending);
         }
-        "for_statement" | "for_in_statement" | "for_expression" | "for_range_loop"
-        | "list_comprehension" | "set_comprehension" | "dictionary_comprehension"
+        "for_statement"
+        | "for_in_statement"
+        | "for_expression"
+        | "for_range_loop"
+        | "list_comprehension"
+        | "set_comprehension"
+        | "dictionary_comprehension"
         | "generator_expression" => {
             roles.push(Role::Iterating);
         }

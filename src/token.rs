@@ -42,13 +42,19 @@ impl Default for TokenPolicy {
 impl TokenPolicy {
     /// No tokens at all. Safe for any endpoint, including a third-party LLM.
     pub fn none() -> Self {
-        Self { allowed: BTreeSet::new(), all: false }
+        Self {
+            allowed: BTreeSet::new(),
+            all: false,
+        }
     }
 
     /// Every token, including literal values. LOCAL ENDPOINTS ONLY — this can carry
     /// secrets, PII and proprietary logic verbatim.
     pub fn all() -> Self {
-        Self { allowed: BTreeSet::new(), all: true }
+        Self {
+            allowed: BTreeSet::new(),
+            all: true,
+        }
     }
 
     /// Names and types but never values: enough to say *what* changed without disclosing

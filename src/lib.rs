@@ -35,8 +35,8 @@ pub use role::{roles_for_native, Role};
 pub use token::TokenPolicy;
 
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;   // BTree, not Hash: props must serialise deterministically
-                                    // or two identical trees would not compare equal.
+use std::collections::BTreeMap; // BTree, not Hash: props must serialise deterministically
+                                // or two identical trees would not compare equal.
 
 /// A half-open byte range into the original source.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -83,6 +83,13 @@ pub struct UastNode {
     /// exactly what lets a UAST be sent somewhere raw source cannot go.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub roles: Vec<Role>,
+    /// Literal source text, carried ONLY where [`TokenPolicy`] permits it for this node's
+    /// category. `None` under the default policy.
+    ///
+    /// This is the one field that can carry secrets, PII or proprietary logic verbatim, so
+    /// it is opt-in per category and absent unless explicitly allowed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub children: Vec<UastNode>,
 }
@@ -98,6 +105,7 @@ impl UastNode {
             span,
             props: BTreeMap::new(),
             roles: roles_for_native(&native_type_for_roles),
+            token: None,
             children: Vec::new(),
         }
     }
@@ -149,6 +157,15 @@ pub trait SourceTree {
     fn children(&self) -> Vec<&Self>
     where
         Self: Sized;
+
+    /// The literal source text of this node, if the caller can supply it.
+    ///
+    /// On the trait rather than passed alongside as raw bytes: the tree already knows its
+    /// own spans, and making callers re-supply source invites an off-by-one between a span
+    /// and the buffer it indexes. Defaults to `None` so fixtures need not implement it.
+    fn token(&self) -> Option<&str> {
+        None
+    }
 }
 
 /// Normalise a source tree into canonical UAST.
@@ -158,20 +175,40 @@ pub trait SourceTree {
 /// produce the same UAST across grammars — Python wraps a call in `expression_statement`,
 /// Go does not, and that difference must not survive normalisation.
 pub fn normalize<T: SourceTree>(tree: &T, language: &str) -> UastNode {
+    normalize_with(tree, language, &TokenPolicy::none())
+}
+
+/// Normalise, carrying source tokens where `policy` permits.
+///
+/// Structure is identical whatever the policy; only [`UastNode::token`] varies. That
+/// property is what lets one normalisation serve both a local consumer and a cloud one.
+pub fn normalize_with<T: SourceTree>(tree: &T, language: &str, policy: &TokenPolicy) -> UastNode {
     let mut root = UastNode::new(tree.node_type(), language, tree.span());
-    root.children = normalize_children(tree, language);
+    apply_token(&mut root, tree, policy);
+    root.children = normalize_children(tree, language, policy);
     root
 }
 
-fn normalize_children<T: SourceTree>(tree: &T, language: &str) -> Vec<UastNode> {
+fn apply_token<T: SourceTree>(node: &mut UastNode, source: &T, policy: &TokenPolicy) {
+    if policy.permits(node.category) {
+        node.token = source.token().map(str::to_owned);
+    }
+}
+
+fn normalize_children<T: SourceTree>(
+    tree: &T,
+    language: &str,
+    policy: &TokenPolicy,
+) -> Vec<UastNode> {
     let mut out = Vec::new();
     for child in tree.children() {
         if is_wrapper_type(child.node_type()) {
             // Splice through: the wrapper itself is not a level of meaning.
-            out.extend(normalize_children(child, language));
+            out.extend(normalize_children(child, language, policy));
         } else {
             let mut node = UastNode::new(child.node_type(), language, child.span());
-            node.children = normalize_children(child, language);
+            apply_token(&mut node, child, policy);
+            node.children = normalize_children(child, language, policy);
             out.push(node);
         }
     }
@@ -185,6 +222,7 @@ mod tests {
     /// A test tree standing in for any tree-sitter CST.
     struct T {
         t: &'static str,
+        tok: Option<&'static str>,
         c: Vec<T>,
     }
     impl SourceTree for T {
@@ -197,12 +235,45 @@ mod tests {
         fn children(&self) -> Vec<&Self> {
             self.c.iter().collect()
         }
+        fn token(&self) -> Option<&str> {
+            self.tok
+        }
     }
     fn n(t: &'static str, c: Vec<T>) -> T {
-        T { t, c }
+        T { t, tok: None, c }
     }
     fn leaf(t: &'static str) -> T {
         n(t, vec![])
+    }
+    /// A leaf carrying source text, for policy tests.
+    fn tok(t: &'static str, text: &'static str) -> T {
+        T {
+            t,
+            tok: Some(text),
+            c: vec![],
+        }
+    }
+
+    /// A tree with a secret in a literal and a name in an identifier — the two things a
+    /// policy must be able to separate.
+    fn sensitive() -> T {
+        n(
+            "function_definition",
+            vec![n(
+                "block",
+                vec![
+                    tok("identifier", "charge_customer"),
+                    tok("string", "sk-live-SECRET-VALUE"),
+                ],
+            )],
+        )
+    }
+
+    fn tokens(u: &UastNode) -> Vec<String> {
+        std::iter::once(u)
+            .chain(u.descendants())
+            .filter_map(|n| n.token.clone())
+            .collect()
     }
 
     #[test]
@@ -222,7 +293,10 @@ mod tests {
         // must normalise to the same shape or cross-language reasoning is impossible.
         let pythonish = n(
             "function_definition",
-            vec![n("block", vec![n("expression_statement", vec![leaf("call")])])],
+            vec![n(
+                "block",
+                vec![n("expression_statement", vec![leaf("call")])],
+            )],
         );
         let goish = n("function_declaration", vec![leaf("call_expression")]);
 
@@ -235,7 +309,10 @@ mod tests {
                 .collect()
         };
         assert_eq!(shape(&a), shape(&b));
-        assert_eq!(shape(&a), vec![Category::FunctionDeclaration, Category::Call]);
+        assert_eq!(
+            shape(&a),
+            vec![Category::FunctionDeclaration, Category::Call]
+        );
     }
 
     #[test]
@@ -254,10 +331,13 @@ mod tests {
         // different SHAPES, and the canonical tree must keep them different.
         let guard = n(
             "function_definition",
-            vec![n("block", vec![
-                n("if_statement", vec![leaf("return_statement")]),
-                leaf("call"),
-            ])],
+            vec![n(
+                "block",
+                vec![
+                    n("if_statement", vec![leaf("return_statement")]),
+                    leaf("call"),
+                ],
+            )],
         );
         let wrapped = n(
             "function_definition",
@@ -266,15 +346,88 @@ mod tests {
         let g = normalize(&guard, "python");
         let w = normalize(&wrapped, "python");
         assert_ne!(g, w);
-        assert!(g.find(Category::Conditional).unwrap().find(Category::Return).is_some());
-        assert!(w.find(Category::Conditional).unwrap().find(Category::Return).is_none());
+        assert!(g
+            .find(Category::Conditional)
+            .unwrap()
+            .find(Category::Return)
+            .is_some());
+        assert!(w
+            .find(Category::Conditional)
+            .unwrap()
+            .find(Category::Return)
+            .is_none());
+    }
+
+    #[test]
+    fn the_default_policy_carries_no_tokens_at_all() {
+        // The load-bearing privacy guarantee. A leak here is silent and unrecoverable once
+        // the data has left, so this must fail loudly rather than subtly.
+        let u = normalize(&sensitive(), "python");
+        assert!(
+            tokens(&u).is_empty(),
+            "default policy leaked tokens: {:?}",
+            tokens(&u)
+        );
+    }
+
+    #[test]
+    fn signatures_carry_names_but_never_literal_values() {
+        let u = normalize_with(&sensitive(), "python", &TokenPolicy::signatures());
+        let got = tokens(&u);
+        assert!(
+            got.contains(&"charge_customer".to_owned()),
+            "want the identifier: {got:?}"
+        );
+        assert!(
+            !got.iter().any(|t| t.contains("SECRET")),
+            "signatures must never carry a literal value: {got:?}"
+        );
+    }
+
+    #[test]
+    fn deny_beats_a_blanket_allow_end_to_end() {
+        // "everything except literals" is the policy most reviews actually want.
+        let u = normalize_with(
+            &sensitive(),
+            "python",
+            &TokenPolicy::all().deny(Category::Literal),
+        );
+        let got = tokens(&u);
+        assert!(got.contains(&"charge_customer".to_owned()));
+        assert!(
+            !got.iter().any(|t| t.contains("SECRET")),
+            "denied literal leaked: {got:?}"
+        );
+    }
+
+    #[test]
+    fn policy_changes_tokens_only_never_structure() {
+        // One normalisation must serve a local consumer and a cloud one, so the shape has
+        // to be identical and only the tokens may differ.
+        let strip = |mut u: UastNode| -> UastNode {
+            u.token = None;
+            u.children = u.children.into_iter().map(strip_rec).collect();
+            u
+        };
+        fn strip_rec(mut u: UastNode) -> UastNode {
+            u.token = None;
+            u.children = u.children.into_iter().map(strip_rec).collect();
+            u
+        }
+        let bare = normalize(&sensitive(), "python");
+        let full = normalize_with(&sensitive(), "python", &TokenPolicy::all());
+        assert_ne!(bare, full, "policies must actually differ");
+        assert_eq!(bare, strip(full), "structure must be identical");
     }
 
     #[test]
     fn counting_walks_the_whole_subtree() {
         let tree = n(
             "function_definition",
-            vec![n("block", vec![leaf("call"), n("if_statement", vec![leaf("call")])])],
+            vec![n(
+                "block",
+                vec![leaf("call"), n("if_statement", vec![leaf("call")])],
+            )],
         );
         let u = normalize(&tree, "python");
         assert_eq!(u.count(Category::Call), 2);

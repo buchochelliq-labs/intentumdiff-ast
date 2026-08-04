@@ -197,10 +197,24 @@ pub fn categorize(native: &str) -> Category {
         }
         "array" | "block_sequence" | "flow_sequence" => Category::Sequence,
         "pair" | "block_mapping_pair" | "flow_pair" | "setting" => Category::KeyValuePair,
-        "string" | "number" | "true" | "false" | "null" | "integer" | "float" | "boolean"
-        | "string_scalar" | "integer_scalar" | "float_scalar" | "boolean_scalar"
-        | "null_scalar" | "plain_scalar" | "block_scalar" | "double_quote_scalar"
-        | "single_quote_scalar" | "setting_value" => Category::Literal,
+        "string"
+        | "number"
+        | "true"
+        | "false"
+        | "null"
+        | "integer"
+        | "float"
+        | "boolean"
+        | "string_scalar"
+        | "integer_scalar"
+        | "float_scalar"
+        | "boolean_scalar"
+        | "null_scalar"
+        | "plain_scalar"
+        | "block_scalar"
+        | "double_quote_scalar"
+        | "single_quote_scalar"
+        | "setting_value" => Category::Literal,
 
         // ── Markup. An XML element owns BOTH attributes and ordered children, which is
         // neither a mapping nor a sequence — it needs its own pair of categories.
@@ -219,8 +233,12 @@ pub fn categorize(native: &str) -> Category {
             Category::Identifier
         }
         "type_identifier" | "type_annotation" | "primitive_type" => Category::TypeReference,
-        "import_statement" | "import_declaration" | "import_from_statement" | "use_declaration"
-        | "require_call" | "include_statement" => Category::Import,
+        "import_statement"
+        | "import_declaration"
+        | "import_from_statement"
+        | "use_declaration"
+        | "require_call"
+        | "include_statement" => Category::Import,
 
         _ => Category::Unknown,
     }
@@ -234,11 +252,11 @@ mod tests {
     fn the_same_idea_normalises_across_languages() {
         // The entire point: one category for many spellings.
         for native in [
-            "function_definition",   // python
-            "function_declaration",  // go, js
-            "function_item",         // rust
-            "method_declaration",    // java
-            "arrow_function",        // js
+            "function_definition",  // python
+            "function_declaration", // go, js
+            "function_item",        // rust
+            "method_declaration",   // java
+            "arrow_function",       // js
         ] {
             assert_eq!(
                 categorize(native),

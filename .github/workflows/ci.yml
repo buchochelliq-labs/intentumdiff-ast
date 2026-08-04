@@ -1,0 +1,59 @@
+name: CI
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Deny by default: each job asks for exactly what it needs rather than inheriting the
+# repository default, which can be read-write.
+permissions: {}
+
+jobs:
+  test:
+    name: Tests + lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      # 1.95.0 matches the rest of the estate. wasm32-wasip2 is not optional here: the
+      # crate CLAIMS to be usable from a wasm component (no tree-sitter, no C deps), and an
+      # unenforced claim drifts the moment someone adds a convenient dependency.
+      - name: Install Rust 1.95.0 (+ wasm32-wasip2)
+        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # stable
+        with:
+          toolchain: 1.95.0
+          targets: wasm32-wasip2
+          components: clippy, rustfmt
+
+      - name: Cache Rust build artefacts
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Tests
+        run: cargo test --all
+
+      # The load-bearing portability claim, enforced rather than asserted.
+      - name: Build for wasm32-wasip2
+        run: cargo build --target wasm32-wasip2
+
+      # A canonical AST is only canonical if the same input yields the same output. serde
+      # round-tripping is the cheapest guard against a field that serialises unstably.
+      - name: Docs build without warnings
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --no-deps
