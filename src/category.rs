@@ -33,6 +33,13 @@ pub enum Category {
     Paragraph,
     ListItem,
     CodeBlock,
+    /// The root of a parsed file.
+    ///
+    /// Root wrapper types (`document`, `source_file`, `program`, …) collapse when they
+    /// appear as CHILDREN, but the root itself is kept: it is the only node representing
+    /// the file as a whole, and leaving it `Unknown` made every tree contain one
+    /// meaningless node.
+    File,
     // ── References ──────────────────────────────────────────────────────────
     Identifier,
     TypeReference,
@@ -43,7 +50,7 @@ pub enum Category {
 
 impl Category {
     /// Every category, for policies that need to enumerate.
-    pub const ALL: [Category; 22] = [
+    pub const ALL: [Category; 23] = [
         Category::FunctionDeclaration,
         Category::ClassDeclaration,
         Category::Conditional,
@@ -62,6 +69,7 @@ impl Category {
         Category::Paragraph,
         Category::ListItem,
         Category::CodeBlock,
+        Category::File,
         Category::Identifier,
         Category::TypeReference,
         Category::Import,
@@ -100,12 +108,37 @@ pub fn is_wrapper_type(native: &str) -> bool {
     )
 }
 
-/// Map a native (grammar-specific) node type onto a canonical category.
+/// Map a native node type onto a canonical category, in the context of its language.
 ///
-/// Deliberately conservative: an unrecognised type is `Unknown`, never a near-miss. A wrong
-/// category is worse than an honest gap because downstream reasoning cannot tell it was a
-/// guess — rule 3 in SPEC.md.
-pub fn categorize(native: &str) -> Category {
+/// The `language` parameter is load-bearing, not decoration. Node types are **grammar
+/// scoped**, so the same name can mean different things: INI emits `section` for a
+/// `[section]` block (a [`Category::Mapping`]) while Markdown emits `section` for a
+/// document section (a [`Category::Section`]). A global table silently mis-categorises one
+/// of them, which is precisely the "wrong category is worse than an honest gap" failure.
+///
+/// Most types are unambiguous, so the common path is a single global table with a small
+/// per-language override in front of it.
+pub fn categorize(native: &str, language: &str) -> Category {
+    if let Some(specific) = categorize_for_language(native, language) {
+        return specific;
+    }
+    categorize_global(native)
+}
+
+/// Overrides for native types whose meaning depends on the grammar that produced them.
+///
+/// Keep this small and evidenced. Every entry should name the real collision it resolves —
+/// a speculative override is a mis-categorisation waiting to happen.
+fn categorize_for_language(native: &str, language: &str) -> Option<Category> {
+    match (language, native) {
+        // `section`: a Markdown document section vs an INI/TOML `[section]` mapping.
+        ("markdown" | "mdx", "section") => Some(Category::Section),
+        ("ini" | "toml" | "cfg", "section") => Some(Category::Mapping),
+        _ => None,
+    }
+}
+
+fn categorize_global(native: &str) -> Category {
     match native {
         // Functions. Covers def/fn/lambda/method across the tree-sitter grammars.
         "function_definition"
@@ -192,11 +225,16 @@ pub fn categorize(native: &str) -> Category {
         // mappings, sequences and scalars. Every reference we surveyed (Codefang,
         // UAST-Grep, Semgrep) has a code-centric vocabulary and no answer here, yet
         // config and data files are a large share of a real review.
-        "object" | "block_mapping" | "flow_mapping" | "table" | "inline_table" | "section" => {
+        "object" | "block_mapping" | "flow_mapping" | "inline_table" | "section" => {
             Category::Mapping
         }
-        "array" | "block_sequence" | "flow_sequence" => Category::Sequence,
-        "pair" | "block_mapping_pair" | "flow_pair" | "setting" => Category::KeyValuePair,
+        "array"
+        | "block_sequence"
+        | "flow_sequence"
+        | "block_sequence_item"
+        | "flow_sequence_item"
+        | "table_array_element" => Category::Sequence,
+        "pair" | "block_mapping_pair" | "flow_pair" | "setting" | "table" => Category::KeyValuePair,
         "string"
         | "number"
         | "true"
@@ -218,20 +256,29 @@ pub fn categorize(native: &str) -> Category {
 
         // ── Markup. An XML element owns BOTH attributes and ordered children, which is
         // neither a mapping nor a sequence — it needs its own pair of categories.
-        "element" | "start_tag" | "self_closing_tag" => Category::Element,
+        "element" | "start_tag" | "self_closing_tag" | "content" => Category::Element,
         "attribute" | "xmlns" => Category::Attribute,
 
         // ── Document. Markdown is prose structure: headings nest, paragraphs and list
         // items are content. Nothing in a code vocabulary describes this.
         "atx_heading" | "setext_heading" => Category::Section,
-        "paragraph" => Category::Paragraph,
+        "paragraph" | "inline" => Category::Paragraph,
+        "block_quote" => Category::Paragraph,
         "list_item" => Category::ListItem,
         "fenced_code_block" | "indented_code_block" | "code_block" => Category::CodeBlock,
 
+        // Root wrapper types. These also appear in is_wrapper_type so they COLLAPSE when
+        // nested; this arm only takes effect for the root, which is never collapsed.
+        "document" | "source_file" | "program" | "config_file" | "module" => Category::File,
+
         // ── References
-        "identifier" | "bare_key" | "dotted_key" | "key" | "property_identifier" => {
-            Category::Identifier
-        }
+        "identifier"
+        | "bare_key"
+        | "dotted_key"
+        | "key"
+        | "property_identifier"
+        | "section_name"
+        | "setting_name" => Category::Identifier,
         "type_identifier" | "type_annotation" | "primitive_type" => Category::TypeReference,
         "import_statement"
         | "import_declaration"
@@ -259,16 +306,20 @@ mod tests {
             "arrow_function",       // js
         ] {
             assert_eq!(
-                categorize(native),
+                categorize(native, "python"),
                 Category::FunctionDeclaration,
                 "{native} should be a function"
             );
         }
         for native in ["if_statement", "if_expression", "unless_statement"] {
-            assert_eq!(categorize(native), Category::Conditional, "{native}");
+            assert_eq!(
+                categorize(native, "python"),
+                Category::Conditional,
+                "{native}"
+            );
         }
         for native in ["for_statement", "while_expression", "list_comprehension"] {
-            assert_eq!(categorize(native), Category::Loop, "{native}");
+            assert_eq!(categorize(native, "python"), Category::Loop, "{native}");
         }
     }
 
@@ -276,8 +327,11 @@ mod tests {
     fn unrecognised_types_are_unknown_not_guessed() {
         // Rule 3: an honest gap beats a wrong category, because a consumer cannot tell a
         // near-miss from a real match.
-        assert_eq!(categorize("some_exotic_grammar_node"), Category::Unknown);
-        assert_eq!(categorize(""), Category::Unknown);
+        assert_eq!(
+            categorize("some_exotic_grammar_node", "cobol"),
+            Category::Unknown
+        );
+        assert_eq!(categorize("", "cobol"), Category::Unknown);
     }
 
     #[test]
@@ -286,5 +340,100 @@ mod tests {
             assert!(is_wrapper_type(w), "{w} is scaffolding");
         }
         assert!(!is_wrapper_type("if_statement"));
+    }
+}
+
+#[cfg(test)]
+mod non_code_coverage_tests {
+    use super::*;
+
+    /// Node types taken from the ACTUAL parser sources, not invented. If a salient one here
+    /// maps to `Unknown`, the corresponding diff carries no structural meaning at all.
+    #[test]
+    fn real_parser_node_types_are_covered() {
+        let cases: &[(&str, &[&str])] = &[
+            (
+                "json",
+                &[
+                    "object", "array", "pair", "string", "number", "true", "false", "null",
+                ],
+            ),
+            (
+                "yaml",
+                &[
+                    "block_mapping_pair",
+                    "block_sequence",
+                    "block_sequence_item",
+                    "flow_pair",
+                    "flow_sequence",
+                    "plain_scalar",
+                    "double_quote_scalar",
+                    "single_quote_scalar",
+                    "key",
+                ],
+            ),
+            (
+                "toml",
+                &[
+                    "pair",
+                    "table_array_element",
+                    "inline_table",
+                    "bare_key",
+                    "string",
+                ],
+            ),
+            ("xml", &["element", "attribute", "content"]),
+            (
+                "markdown",
+                &[
+                    "atx_heading",
+                    "setext_heading",
+                    "section",
+                    "paragraph",
+                    "inline",
+                    "list_item",
+                    "fenced_code_block",
+                    "block_quote",
+                ],
+            ),
+            (
+                "ini",
+                &["section", "setting", "setting_name", "setting_value"],
+            ),
+        ];
+
+        let mut uncovered = Vec::new();
+        for (language, types) in cases {
+            for native in *types {
+                if categorize(native, language) == Category::Unknown {
+                    uncovered.push(format!("{language}:{native}"));
+                }
+            }
+        }
+        assert!(
+            uncovered.is_empty(),
+            "uncategorised real node types: {uncovered:?}"
+        );
+    }
+
+    #[test]
+    fn the_section_collision_is_resolved_by_language() {
+        // The bug that validating against real parser output exposed. INI's `[section]` is
+        // a mapping; Markdown's `section` is a document section. A global table has to be
+        // wrong about one of them.
+        assert_eq!(categorize("section", "ini"), Category::Mapping);
+        assert_eq!(categorize("section", "toml"), Category::Mapping);
+        assert_eq!(categorize("section", "markdown"), Category::Section);
+        assert_eq!(categorize("section", "mdx"), Category::Section);
+    }
+
+    #[test]
+    fn unambiguous_types_do_not_need_a_language() {
+        // Most types mean the same thing everywhere; only genuine collisions get an
+        // override, so an unknown language still categorises correctly.
+        for lang in ["python", "json", "made_up_language"] {
+            assert_eq!(categorize("array", lang), Category::Sequence);
+            assert_eq!(categorize("pair", lang), Category::KeyValuePair);
+        }
     }
 }

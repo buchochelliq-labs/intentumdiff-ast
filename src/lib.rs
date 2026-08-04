@@ -99,10 +99,14 @@ impl UastNode {
     pub fn new(native_type: impl Into<String>, language: impl Into<String>, span: Span) -> Self {
         let native_type = native_type.into();
         let native_type_for_roles = native_type.clone();
+        let language = language.into();
         Self {
-            category: categorize(&native_type),
+            // Language-aware: the same native type can mean different things in different
+            // grammars (INI `section` is a mapping, Markdown `section` is a document
+            // section), so the category cannot be decided from the type alone.
+            category: categorize(&native_type, &language),
             native_type,
-            language: language.into(),
+            language,
             span,
             props: BTreeMap::new(),
             roles: roles_for_native(&native_type_for_roles),
@@ -617,6 +621,106 @@ mod tests {
             .find(Category::Conditional)
             .unwrap()
             .has_role(Role::Negated));
+    }
+
+    #[test]
+    fn equivalent_json_and_yaml_normalise_identically() {
+        // THE acceptance test for the data family (#5). The same document:
+        //
+        //     {"name": "svc", "ports": [80, 443]}      name: svc
+        //                                              ports:
+        //                                                - 80
+        //                                                - 443
+        //
+        // If these do not agree, the canonical vocabulary is not canonical, and a diff
+        // between a JSON file and its YAML equivalent would show spurious changes.
+        let json = n(
+            "document",
+            vec![n(
+                "object",
+                vec![
+                    n("pair", vec![leaf("key"), leaf("string")]),
+                    n(
+                        "pair",
+                        vec![
+                            leaf("key"),
+                            n("array", vec![leaf("number"), leaf("number")]),
+                        ],
+                    ),
+                ],
+            )],
+        );
+        let yaml = n(
+            "document",
+            vec![n(
+                "block_mapping",
+                vec![
+                    n(
+                        "block_mapping_pair",
+                        vec![leaf("key"), leaf("plain_scalar")],
+                    ),
+                    n(
+                        "block_mapping_pair",
+                        vec![
+                            leaf("key"),
+                            n(
+                                "block_sequence",
+                                vec![leaf("plain_scalar"), leaf("plain_scalar")],
+                            ),
+                        ],
+                    ),
+                ],
+            )],
+        );
+
+        let shape = |u: &UastNode| -> Vec<Category> {
+            std::iter::once(u)
+                .chain(u.descendants())
+                .map(|n| n.category)
+                .collect()
+        };
+        let a = normalize(&json, "json");
+        let b = normalize(&yaml, "yaml");
+        assert_eq!(
+            shape(&a),
+            shape(&b),
+            "equivalent documents must produce one canonical shape"
+        );
+        // And that shape is meaningful, not uniformly Unknown.
+        assert_eq!(a.count(Category::KeyValuePair), 2);
+        assert_eq!(a.count(Category::Sequence), 1);
+        assert!(
+            !shape(&a).contains(&Category::Unknown),
+            "no Unknown in a covered format"
+        );
+    }
+
+    #[test]
+    fn markdown_and_ini_sections_do_not_collide() {
+        // Same native type, different grammars, different meanings — decided by language.
+        let md = normalize(&n("section", vec![leaf("paragraph")]), "markdown");
+        let ini = normalize(&n("section", vec![leaf("setting")]), "ini");
+        assert_eq!(md.category, Category::Section);
+        assert_eq!(ini.category, Category::Mapping);
+    }
+
+    #[test]
+    fn an_xml_element_owns_both_attributes_and_ordered_children() {
+        // The question #5 posed: is `element` its own category, or just a KeyValuePair?
+        // It is its own, because it carries BOTH keyed attributes and ordered content —
+        // which is neither a Mapping nor a Sequence.
+        let xml = n(
+            "element",
+            vec![
+                leaf("attribute"),
+                leaf("attribute"),
+                n("element", vec![leaf("content")]),
+            ],
+        );
+        let u = normalize(&xml, "xml");
+        assert_eq!(u.category, Category::Element);
+        assert_eq!(u.count(Category::Attribute), 2);
+        assert!(u.find(Category::Element).is_some());
     }
 
     #[test]
