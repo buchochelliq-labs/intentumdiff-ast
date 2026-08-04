@@ -28,11 +28,13 @@
 
 pub mod category;
 pub mod role;
+pub mod skeleton;
 pub mod structural;
 pub mod token;
 
 pub use category::{categorize, is_wrapper_type, Category};
 pub use role::{roles_for_native, Role};
+pub use skeleton::skeleton;
 pub use token::TokenPolicy;
 
 use serde::{Deserialize, Serialize};
