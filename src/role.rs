@@ -7,7 +7,7 @@
 //! `FunctionDeclaration`, `LambdaExpression`, `MethodDeclaration`, `ArrowFunction` — where
 //! every consumer must remember to enumerate all four to mean "a function".
 //!
-//! Roles factor the orthogonal part out. One [`Category::Function`] carrying
+//! Roles factor the orthogonal part out. One [`Category::FunctionDeclaration`] carrying
 //! `[Lambda]` or `[Declaration, Public]` answers both "is this a function?" (cheap) and
 //! "is it anonymous?" (also cheap), and new distinctions are added without a new category
 //! and without breaking existing queries.
