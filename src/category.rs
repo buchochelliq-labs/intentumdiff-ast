@@ -33,6 +33,14 @@ pub enum Category {
     Paragraph,
     ListItem,
     CodeBlock,
+    // ── Query (SQL) ─────────────────────────────────────────────────────────
+    // SQL is neither code nor data in the shapes above. A SELECT is a declarative
+    // composition of CLAUSES: not a Mapping (nothing is keyed), not a Sequence (order is
+    // fixed by the grammar, not chosen by the author), and not a Call. It needs its own
+    // pair, and the clause KIND rides on a role so six clause types do not become six
+    // categories.
+    Query,
+    Clause,
     /// The root of a parsed file.
     ///
     /// Root wrapper types (`document`, `source_file`, `program`, …) collapse when they
@@ -50,7 +58,7 @@ pub enum Category {
 
 impl Category {
     /// Every category, for policies that need to enumerate.
-    pub const ALL: [Category; 23] = [
+    pub const ALL: [Category; 25] = [
         Category::FunctionDeclaration,
         Category::ClassDeclaration,
         Category::Conditional,
@@ -69,6 +77,8 @@ impl Category {
         Category::Paragraph,
         Category::ListItem,
         Category::CodeBlock,
+        Category::Query,
+        Category::Clause,
         Category::File,
         Category::Identifier,
         Category::TypeReference,
@@ -105,6 +115,11 @@ pub fn is_wrapper_type(native: &str) -> bool {
             | "document"
             | "config_file"
             | "suite"
+            // PL/SQL BEGIN … END and the statement wrapper carry no meaning of their own.
+            | "plsql_block"
+            | "begin_statement"
+            | "end_statement"
+            | "statement"
     )
 }
 
@@ -271,6 +286,28 @@ fn categorize_global(native: &str) -> Category {
         // nested; this arm only takes effect for the root, which is never collapsed.
         "document" | "source_file" | "program" | "config_file" | "module" => Category::File,
 
+        // ── Query. T-SQL SELECT and friends.
+        "select_statement" | "insert_statement" | "update_statement" | "delete_statement"
+        | "merge_statement" | "with_clause" => Category::Query,
+        "select_clause" | "from_clause" | "where_clause" | "join_clause" | "group_by_clause"
+        | "order_by_clause" | "having_clause" | "limit_clause" | "select_item" => Category::Clause,
+
+        // PL/SQL is PROCEDURAL, so it maps onto the existing code vocabulary rather than
+        // needing its own. A package is a named container of members — a class in all but
+        // spelling — and an exception section is a catch block.
+        "create_or_replace_function_body"
+        | "create_or_replace_procedure_body"
+        | "create_or_alter_function_statement"
+        | "create_or_alter_procedure_statement"
+        | "create_or_replace_trigger" => Category::FunctionDeclaration,
+        "create_or_replace_package"
+        | "create_or_replace_package_body"
+        | "create_or_replace_type"
+        | "create_or_replace_type_body" => Category::ClassDeclaration,
+        "exception_section" => Category::TryBlock,
+        "assignment_statement" => Category::Assignment,
+        "call_statement" => Category::Call,
+
         // ── References
         "identifier"
         | "bare_key"
@@ -435,5 +472,158 @@ mod non_code_coverage_tests {
             assert_eq!(categorize("array", lang), Category::Sequence);
             assert_eq!(categorize("pair", lang), Category::KeyValuePair);
         }
+    }
+}
+
+#[cfg(test)]
+mod sql_tests {
+    use super::*;
+    use crate::{normalize, Role, SourceTree, Span};
+
+    struct T {
+        t: &'static str,
+        c: Vec<T>,
+    }
+    impl SourceTree for T {
+        fn node_type(&self) -> &str {
+            self.t
+        }
+        fn span(&self) -> Span {
+            Span::default()
+        }
+        fn children(&self) -> Vec<&Self> {
+            self.c.iter().collect()
+        }
+    }
+    fn n(t: &'static str, c: Vec<T>) -> T {
+        T { t, c }
+    }
+    fn leaf(t: &'static str) -> T {
+        n(t, vec![])
+    }
+
+    #[test]
+    fn a_select_is_a_query_of_clauses() {
+        // Node types from the real T-SQL parser. A SELECT is neither a Mapping (nothing is
+        // keyed) nor a Sequence (clause order is the grammar's, not the author's).
+        let q = n(
+            "select_statement",
+            vec![
+                leaf("select_clause"),
+                leaf("from_clause"),
+                leaf("join_clause"),
+                leaf("where_clause"),
+            ],
+        );
+        let u = normalize(&q, "tsql");
+        assert_eq!(u.category, Category::Query);
+        assert_eq!(u.count(Category::Clause), 4);
+    }
+
+    #[test]
+    fn clause_kinds_ride_on_roles_not_categories() {
+        // Six clause types would mean six categories and an enumeration at every call site.
+        // One Clause category plus a role keeps "is this a clause?" a single comparison.
+        let q = n(
+            "select_statement",
+            vec![
+                leaf("join_clause"),
+                leaf("where_clause"),
+                leaf("order_by_clause"),
+            ],
+        );
+        let u = normalize(&q, "tsql");
+        let role_of = |r: Role| {
+            u.descendants()
+                .into_iter()
+                .filter(|n| n.category == Category::Clause && n.has_role(r))
+                .count()
+        };
+        // A JOIN changes result CARDINALITY; a diff must never treat that as cosmetic.
+        assert_eq!(role_of(Role::Joining), 1);
+        assert_eq!(role_of(Role::Filtering), 1);
+        assert_eq!(role_of(Role::Ordering), 1);
+    }
+
+    #[test]
+    fn plsql_reuses_the_code_vocabulary() {
+        // PL/SQL is procedural, so it needs no new categories: a package is a named
+        // container of members, an exception section is a catch block.
+        assert_eq!(
+            categorize("create_or_replace_function_body", "plsql"),
+            Category::FunctionDeclaration
+        );
+        assert_eq!(
+            categorize("create_or_replace_package", "plsql"),
+            Category::ClassDeclaration
+        );
+        assert_eq!(categorize("exception_section", "plsql"), Category::TryBlock);
+        assert_eq!(categorize("call_statement", "plsql"), Category::Call);
+        assert_eq!(
+            categorize("assignment_statement", "plsql"),
+            Category::Assignment
+        );
+    }
+
+    #[test]
+    fn plsql_block_scaffolding_collapses() {
+        // BEGIN … END carries no meaning; its children belong to the enclosing procedure.
+        let proc = n(
+            "create_or_replace_procedure_body",
+            vec![n(
+                "plsql_block",
+                vec![n("statement", vec![leaf("call_statement")])],
+            )],
+        );
+        let u = normalize(&proc, "plsql");
+        assert_eq!(u.category, Category::FunctionDeclaration);
+        assert_eq!(u.children.len(), 1, "wrappers should have collapsed: {u:?}");
+        assert_eq!(u.children[0].category, Category::Call);
+    }
+
+    #[test]
+    fn every_real_sql_node_type_is_covered() {
+        let cases: &[(&str, &[&str])] = &[
+            (
+                "tsql",
+                &[
+                    "select_statement",
+                    "select_clause",
+                    "from_clause",
+                    "where_clause",
+                    "join_clause",
+                    "group_by_clause",
+                    "order_by_clause",
+                    "select_item",
+                    "create_or_alter_function_statement",
+                    "create_or_alter_procedure_statement",
+                ],
+            ),
+            (
+                "plsql",
+                &[
+                    "create_or_replace_function_body",
+                    "create_or_replace_procedure_body",
+                    "create_or_replace_package",
+                    "create_or_replace_trigger",
+                    "exception_section",
+                    "assignment_statement",
+                    "call_statement",
+                    "return_statement",
+                ],
+            ),
+        ];
+        let mut uncovered = Vec::new();
+        for (language, types) in cases {
+            for native in *types {
+                if categorize(native, language) == Category::Unknown {
+                    uncovered.push(format!("{language}:{native}"));
+                }
+            }
+        }
+        assert!(
+            uncovered.is_empty(),
+            "uncategorised SQL node types: {uncovered:?}"
+        );
     }
 }

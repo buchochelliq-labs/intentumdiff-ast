@@ -47,6 +47,27 @@ pub enum Role {
     Private,
     /// Cannot be reassigned: const, final, val.
     Immutable,
+    // ── Clause kinds (SQL) ──────────────────────────────────────────────────
+    // Which clause a `Clause` is. Roles rather than six categories, for the same reason a
+    // lambda is Function + [Anonymous]: "is this a clause?" stays one comparison, and
+    // "is it a join?" is another.
+    //
+    // The kinds are NOT equally interesting to a diff. Adding a Joining clause changes
+    // result CARDINALITY; adding a Filtering one changes which rows survive. Both are
+    // meaningful. An Ordering change usually is not. Naming them separately is what lets a
+    // reviewer be told which kind of change happened.
+    /// SELECT — what comes back.
+    Projection,
+    /// FROM — where it comes from.
+    Source,
+    /// WHERE / HAVING — which rows survive.
+    Filtering,
+    /// JOIN — changes cardinality, so a diff should never treat it as cosmetic.
+    Joining,
+    /// GROUP BY — collapses rows.
+    Grouping,
+    /// ORDER BY / LIMIT — presentation, usually the least semantic change in a query.
+    Ordering,
 }
 
 impl Role {
@@ -62,6 +83,12 @@ impl Role {
             Role::Public => "Public",
             Role::Private => "Private",
             Role::Immutable => "Immutable",
+            Role::Projection => "Projection",
+            Role::Source => "Source",
+            Role::Filtering => "Filtering",
+            Role::Joining => "Joining",
+            Role::Grouping => "Grouping",
+            Role::Ordering => "Ordering",
         }
     }
 }
@@ -110,6 +137,12 @@ pub fn roles_for_native(native: &str) -> Vec<Role> {
         | "generator_expression" => {
             roles.push(Role::Iterating);
         }
+        "select_clause" | "select_item" => roles.push(Role::Projection),
+        "from_clause" => roles.push(Role::Source),
+        "where_clause" | "having_clause" => roles.push(Role::Filtering),
+        "join_clause" => roles.push(Role::Joining),
+        "group_by_clause" => roles.push(Role::Grouping),
+        "order_by_clause" | "limit_clause" => roles.push(Role::Ordering),
         "unless_statement" | "guard_statement" => {
             // The grammar itself encodes the negation.
             roles.push(Role::Negated);
