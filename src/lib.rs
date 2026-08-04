@@ -28,6 +28,7 @@
 
 pub mod category;
 pub mod role;
+pub mod structural;
 pub mod token;
 
 pub use category::{categorize, is_wrapper_type, Category};
@@ -185,13 +186,30 @@ pub fn normalize<T: SourceTree>(tree: &T, language: &str) -> UastNode {
 pub fn normalize_with<T: SourceTree>(tree: &T, language: &str, policy: &TokenPolicy) -> UastNode {
     let mut root = UastNode::new(tree.node_type(), language, tree.span());
     apply_token(&mut root, tree, policy);
+    apply_source_roles(&mut root, tree);
     root.children = normalize_children(tree, language, policy);
+    // Tail position is a property of the FINISHED tree: it needs wrappers already collapsed
+    // and every child in place, so it runs last rather than during the walk.
+    structural::mark_early_exits(&mut root);
     root
 }
 
 fn apply_token<T: SourceTree>(node: &mut UastNode, source: &T, policy: &TokenPolicy) {
     if policy.permits(node.category) {
         node.token = source.token().map(str::to_owned);
+    }
+}
+
+/// Roles that need the SOURCE tree, decided before its detail is normalised away.
+///
+/// Negation lives in the operator, and wrapper collapse plus categorisation discard exactly
+/// that, so it has to be read here rather than recovered from the finished UAST.
+fn apply_source_roles<T: SourceTree>(node: &mut UastNode, source: &T) {
+    if node.category == Category::Conditional
+        && structural::condition_is_negated(source)
+        && !node.roles.contains(&Role::Negated)
+    {
+        node.roles.push(Role::Negated);
     }
 }
 
@@ -208,6 +226,7 @@ fn normalize_children<T: SourceTree>(
         } else {
             let mut node = UastNode::new(child.node_type(), language, child.span());
             apply_token(&mut node, child, policy);
+            apply_source_roles(&mut node, child);
             node.children = normalize_children(child, language, policy);
             out.push(node);
         }
@@ -418,6 +437,186 @@ mod tests {
         let full = normalize_with(&sensitive(), "python", &TokenPolicy::all());
         assert_ne!(bare, full, "policies must actually differ");
         assert_eq!(bare, strip(full), "structure must be identical");
+    }
+
+    #[test]
+    fn a_guard_clause_is_recognised_in_every_grammar() {
+        // THE acceptance test for #6. Before it, Negated came only from grammars that spell
+        // it (unless/guard), so this worked in Ruby and Swift and failed everywhere else.
+        //
+        //     if not x: return None
+        //     work(x)
+        //
+        // written five ways, all of which must yield Conditional[Negated] > Return[EarlyExit].
+        let cases: Vec<(&str, T)> = vec![
+            (
+                "python",
+                n(
+                    "function_definition",
+                    vec![n(
+                        "block",
+                        vec![
+                            n(
+                                "if_statement",
+                                vec![
+                                    n("not_operator", vec![leaf("identifier")]),
+                                    n("block", vec![leaf("return_statement")]),
+                                ],
+                            ),
+                            leaf("call"),
+                        ],
+                    )],
+                ),
+            ),
+            (
+                "javascript",
+                n(
+                    "function_declaration",
+                    vec![n(
+                        "statement_block",
+                        vec![
+                            n(
+                                "if_statement",
+                                vec![
+                                    T {
+                                        t: "unary_expression",
+                                        tok: Some("!"),
+                                        c: vec![],
+                                    },
+                                    n("statement_block", vec![leaf("return_statement")]),
+                                ],
+                            ),
+                            leaf("call_expression"),
+                        ],
+                    )],
+                ),
+            ),
+            (
+                "go",
+                n(
+                    "function_declaration",
+                    vec![n(
+                        "block",
+                        vec![
+                            n(
+                                "if_statement",
+                                vec![
+                                    T {
+                                        t: "unary_expression",
+                                        tok: Some("!"),
+                                        c: vec![],
+                                    },
+                                    n("block", vec![leaf("return_statement")]),
+                                ],
+                            ),
+                            leaf("call_expression"),
+                        ],
+                    )],
+                ),
+            ),
+            (
+                "rust",
+                n(
+                    "function_item",
+                    vec![n(
+                        "block",
+                        vec![
+                            n(
+                                "if_expression",
+                                vec![
+                                    T {
+                                        t: "unary_expression",
+                                        tok: Some("!"),
+                                        c: vec![],
+                                    },
+                                    n("block", vec![leaf("return_expression")]),
+                                ],
+                            ),
+                            leaf("call_expression"),
+                        ],
+                    )],
+                ),
+            ),
+            (
+                "java",
+                n(
+                    "method_declaration",
+                    vec![n(
+                        "block",
+                        vec![
+                            n(
+                                "if_statement",
+                                vec![
+                                    T {
+                                        t: "unary_expression",
+                                        tok: Some("!"),
+                                        c: vec![],
+                                    },
+                                    n("block", vec![leaf("return_statement")]),
+                                ],
+                            ),
+                            leaf("method_invocation"),
+                        ],
+                    )],
+                ),
+            ),
+        ];
+
+        for (lang, tree) in cases {
+            let u = normalize(&tree, lang);
+            let cond = u
+                .find(Category::Conditional)
+                .unwrap_or_else(|| panic!("{lang}: no conditional"));
+            assert!(
+                cond.has_role(Role::Negated),
+                "{lang}: guard condition should be Negated, roles={:?}",
+                cond.roles
+            );
+            let ret = cond
+                .find(Category::Return)
+                .unwrap_or_else(|| panic!("{lang}: no return inside the guard"));
+            assert!(
+                ret.has_role(Role::EarlyExit),
+                "{lang}: guarded return should be an EarlyExit, roles={:?}",
+                ret.roles
+            );
+        }
+    }
+
+    #[test]
+    fn roles_do_not_depend_on_the_token_policy() {
+        // Roles are structural FACTS. If they varied with disclosure, a cloud-safe UAST
+        // would silently be a worse UAST — reading source to derive structure and carrying
+        // source into output are different things.
+        let tree = n(
+            "function_definition",
+            vec![n(
+                "block",
+                vec![
+                    n(
+                        "if_statement",
+                        vec![
+                            n("not_operator", vec![leaf("identifier")]),
+                            n("block", vec![leaf("return_statement")]),
+                        ],
+                    ),
+                    leaf("call"),
+                ],
+            )],
+        );
+        let bare = normalize(&tree, "python");
+        let full = normalize_with(&tree, "python", &TokenPolicy::all());
+        let roles = |u: &UastNode| -> Vec<Vec<Role>> {
+            std::iter::once(u)
+                .chain(u.descendants())
+                .map(|n| n.roles.clone())
+                .collect()
+        };
+        assert_eq!(roles(&bare), roles(&full), "policy must not change roles");
+        assert!(bare
+            .find(Category::Conditional)
+            .unwrap()
+            .has_role(Role::Negated));
     }
 
     #[test]
