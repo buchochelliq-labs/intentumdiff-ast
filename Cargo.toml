@@ -1,0 +1,20 @@
+[package]
+name = "intentumdiff-ast"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.95"
+description = "Canonical cross-language AST (UAST) — one normalised vocabulary over many grammars"
+license = "MIT"
+repository = "https://github.com/buchochelliq-labs/intentumdiff-ast"
+keywords = ["ast", "uast", "tree-sitter", "static-analysis", "parsing"]
+categories = ["development-tools", "parser-implementations"]
+
+[dependencies]
+# serde only. This crate deliberately does NOT depend on tree-sitter: the normaliser works
+# on anything describable as (type, span, children) via the SourceTree trait, so the
+# canonical vocabulary stays independent of any one parser generator — and stays usable
+# from a wasm component, where a C parser dependency would not be.
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+serde_json = "1"
